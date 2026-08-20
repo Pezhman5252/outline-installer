@@ -1,12 +1,12 @@
 #!/bin/bash
 #
 # =============================================================================
-# Outline Server Installer - Version 3.0 (Gold Standard)
+# Outline Server Installer - Version 3.2 (Final Gold Standard)
 # Fully Interactive + Cloudflare Tunnel + WebSocket Support
 # Designed for users in restricted networks (Iran, China, etc.)
 # =============================================================================
 #
-# Copyright 2024 - Enhanced Version
+# Copyright 2024 - Enhanced Edition
 # Based on original Outline Server installation script
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,7 +56,6 @@ TCP_PATH=""
 UDP_PATH=""
 SECRET_KEY=""
 TUNNEL_URL=""
-PUBLIC_API_URL=""
 CERT_SHA256=""
 
 # Logging files
@@ -170,13 +169,19 @@ function fetch_url() {
     curl --silent --show-error --fail --location "$@"
 }
 
+function sanitize_input() {
+    local input="$1"
+    # Remove carriage returns, non-printable characters, and trim whitespace
+    echo "$input" | tr -d '\r\n' | sed 's/[^[:print:]]//g' | xargs
+}
+
 function print_banner() {
     cat <<EOF
 ${COLOR_CYAN}
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
-║   ${COLOR_WHITE}Outline Server Installer v3.0${COLOR_CYAN}                          ║
-║   ${COLOR_WHITE}Enhanced with Cloudflare Tunnel + WebSocket${COLOR_CYAN}            ║
+║   ${COLOR_WHITE}Outline Server Installer v3.2${COLOR_CYAN}                          ║
+║   ${COLOR_WHITE}Final Gold Standard - Cloudflare Tunnel + WebSocket${COLOR_CYAN}   ║
 ║                                                              ║
 ║   ${COLOR_YELLOW}Designed for Restricted Networks${COLOR_CYAN}                      ║
 ║                                                              ║
@@ -236,7 +241,8 @@ function get_user_input() {
     # Get domain
     while true; do
         echo -ne "${COLOR_WHITE}Enter your domain (e.g., vpn.example.com):${COLOR_RESET} "
-        read -r DOMAIN
+        read -r raw_domain
+        DOMAIN=$(sanitize_input "${raw_domain}")
         
         if [[ -z "${DOMAIN}" ]]; then
             log_error "Domain cannot be empty. Please try again."
@@ -257,7 +263,8 @@ function get_user_input() {
     # Get API port
     while true; do
         echo -ne "${COLOR_WHITE}Enter API port (press Enter for random port):${COLOR_RESET} "
-        read -r API_PORT
+        read -r raw_api_port
+        API_PORT=$(sanitize_input "${raw_api_port}")
         
         if [[ -z "${API_PORT}" ]]; then
             API_PORT=$(( RANDOM % 55535 + 10000 ))
@@ -276,7 +283,8 @@ function get_user_input() {
     # Get keys port
     while true; do
         echo -ne "${COLOR_WHITE}Enter access keys port (press Enter for random port):${COLOR_RESET} "
-        read -r KEYS_PORT
+        read -r raw_keys_port
+        KEYS_PORT=$(sanitize_input "${raw_keys_port}")
         
         if [[ -z "${KEYS_PORT}" ]]; then
             KEYS_PORT=$(( RANDOM % 55535 + 10000 ))
@@ -541,25 +549,37 @@ function check_cloudflare_auth() {
     log_warning "Cloudflare authentication required."
     echo ""
     log_info "Please follow these steps to authenticate with Cloudflare:"
-    echo "  1. The command below will open a browser window."
-    echo "  2. Log in to your Cloudflare account."
-    echo "  3. Select the domain you want to use."
-    echo "  4. Authorize cloudflared to access your account."
+    echo ""
+    echo "  1. ${COLOR_WHITE}Run the following command to get a login URL:${COLOR_RESET}"
+    echo "     ${COLOR_WHITE}cloudflared tunnel login${COLOR_RESET}"
+    echo ""
+    echo "  2. ${COLOR_WHITE}Copy the URL shown in the terminal.${COLOR_RESET}"
+    echo "  3. ${COLOR_WHITE}Open the URL in your browser (on your computer).${COLOR_RESET}"
+    echo "  4. ${COLOR_WHITE}Log in to Cloudflare and select your domain (${DOMAIN}).${COLOR_RESET}"
+    echo "  5. ${COLOR_WHITE}After authorization, return to this terminal and press Enter.${COLOR_RESET}"
     echo ""
     
     if confirm "Run cloudflared login now?"; then
-        cloudflared tunnel login
-        if [[ -f ~/.cloudflared/cert.pem ]]; then
-            log_success "Cloudflare authentication successful."
-            return 0
-        else
-            log_error "Cloudflare authentication failed."
-            return 1
-        fi
+        echo ""
+        log_info "Running cloudflared tunnel login. Please look for the URL in the output below:"
+        echo ""
+        # Run cloudflared login and capture output, but let user see it
+        cloudflared tunnel login 2>&1 | tee -a "${FULL_LOG}"
+        echo ""
+        log_info "After completing the browser authorization, press Enter to continue."
+        read -r
     else
         log_error "Cloudflare authentication is required to continue."
-        log_error "Please run: cloudflared tunnel login"
+        log_error "Please run manually: cloudflared tunnel login"
         exit 1
+    fi
+    
+    if [[ -f ~/.cloudflared/cert.pem ]]; then
+        log_success "Cloudflare authentication successful."
+        return 0
+    else
+        log_error "Cloudflare authentication failed. Please run: cloudflared tunnel login"
+        return 1
     fi
 }
 
@@ -703,7 +723,7 @@ function configure_outline_ss_server() {
     local config_content
     config_content=$(cat <<EOF
 # Outline SS Server Configuration
-# Generated by Outline Installer v3.0
+# Generated by Outline Installer v3.2
 
 web:
   servers:
@@ -1000,11 +1020,7 @@ function main() {
     # Cloudflare Tunnel setup
     log_info "=== Cloudflare Tunnel Setup ==="
     run_step "Installing cloudflared" install_cloudflared
-    if [[ -f ~/.cloudflared/cert.pem ]]; then
-        log_success "Cloudflare authentication found."
-    else
-        run_step "Cloudflare authentication" check_cloudflare_auth
-    fi
+    run_step "Cloudflare authentication" check_cloudflare_auth
     run_step "Setting up Cloudflare Tunnel" setup_cloudflare_tunnel
     echo ""
     
@@ -1031,8 +1047,7 @@ function main() {
 }
 
 # =============================================================================
-# SCRIPT EXECUTION
+# SCRIPT EXECUTION - Direct call (no conditional check needed)
 # =============================================================================
 
-# Ensure the script is run directly, not sourced
 main "$@"
