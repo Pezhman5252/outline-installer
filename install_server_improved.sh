@@ -1,12 +1,12 @@
 #!/bin/bash
 #
 # =============================================================================
-# Outline Server Installer - Version 3.2 (Final Gold Standard)
-# Fully Interactive + Cloudflare Tunnel + WebSocket Support
+# Outline Server Installer - Version 4.0 (Ultimate Gold Standard)
+# Fully Interactive + Cloudflare Tunnel + WebSocket Support + Direct Mode
 # Designed for users in restricted networks (Iran, China, etc.)
 # =============================================================================
 #
-# Copyright 2024 - Enhanced Edition
+# Copyright 2024 - Ultimate Edition
 # Based on original Outline Server installation script
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,6 +49,8 @@ readonly TUNNEL_PORT="8080"
 DOMAIN=""
 API_PORT=""
 KEYS_PORT=""
+USE_CLOUDFLARE=""
+DIRECT_IP=""
 
 # Auto-generated variables
 TUNNEL_ID=""
@@ -80,8 +82,21 @@ readonly COLOR_BOLD='\033[1m'
 
 function log_command() {
     # Execute command and capture both stdout and stderr
-    # stdout is forwarded to terminal and logged, stderr is logged and stored in LAST_ERROR
-    "$@" > >(tee -a "${FULL_LOG}") 2> >(tee -a "${FULL_LOG}" > "${LAST_ERROR}")
+    # Filter out sensitive information before logging
+    local output
+    output=$("$@" 2>&1) || return $?
+    
+    # Filter sensitive data (API keys, secrets, tokens)
+    local filtered_output
+    filtered_output=$(echo "${output}" | sed -E \
+        -e 's/(secret[=: ]+)[^ ]+/\1[FILTERED]/gi' \
+        -e 's/(key[=: ]+)[^ ]+/\1[FILTERED]/gi' \
+        -e 's/(token[=: ]+)[^ ]+/\1[FILTERED]/gi' \
+        -e 's/(password[=: ]+)[^ ]+/\1[FILTERED]/gi' \
+        -e 's/(apiUrl[=: ]+)[^ ]+/\1[FILTERED]/gi' \
+        -e 's/(certSha256[=: ]+)[^ ]+/\1[FILTERED]/gi')
+    
+    echo "${filtered_output}" | tee -a "${FULL_LOG}"
 }
 
 function log_info() {
@@ -232,43 +247,116 @@ trap finish EXIT
 # USER INPUT FUNCTIONS
 # =============================================================================
 
+function check_port_available() {
+    local port="$1"
+    local protocol="${2:-tcp}"
+    
+    # Check if port is in use using ss or netstat
+    if command -v ss &>/dev/null; then
+        if ss -"${protocol}"l 2>/dev/null | grep -q ":${port} "; then
+            return 1
+        fi
+    elif command -v netstat &>/dev/null; then
+        if netstat -"${protocol}"l 2>/dev/null | grep -q ":${port} "; then
+            return 1
+        fi
+    fi
+    
+    # Additional check with /proc/net
+    if [[ -f "/proc/net/${protocol}" ]]; then
+        if grep -qi ":$(printf '%04X' "${port}") " "/proc/net/${protocol}" 2>/dev/null; then
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
 function get_user_input() {
     echo ""
     print_separator
     log_info "Please provide the following information to configure your server:"
     echo ""
     
-    # Get domain
-    while true; do
-        echo -ne "${COLOR_WHITE}Enter your domain (e.g., vpn.example.com):${COLOR_RESET} "
-        read -r raw_domain
-        DOMAIN=$(sanitize_input "${raw_domain}")
-        
-        if [[ -z "${DOMAIN}" ]]; then
-            log_error "Domain cannot be empty. Please try again."
-            continue
-        fi
-        
-        # Basic domain validation
-        if [[ ! "${DOMAIN}" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]]; then
-            log_warning "The domain format seems invalid. Please verify your input."
-            if ! confirm "Continue with '${DOMAIN}'?"; then
+    # Ask about Cloudflare Tunnel usage
+    echo -ne "${COLOR_WHITE}Do you want to use Cloudflare Tunnel? (recommended for restricted networks) [Y/n]:${COLOR_RESET} "
+    read -r cf_response
+    cf_response=$(echo "${cf_response}" | tr '[:upper:]' '[:lower:]')
+    if [[ -z "${cf_response}" ]] || [[ "${cf_response}" == "y" || "${cf_response}" == "yes" ]]; then
+        USE_CLOUDFLARE="yes"
+    else
+        USE_CLOUDFLARE="no"
+    fi
+    
+    # Get domain or IP based on Cloudflare choice
+    if [[ "${USE_CLOUDFLARE}" == "yes" ]]; then
+        while true; do
+            echo -ne "${COLOR_WHITE}Enter your domain (e.g., vpn.example.com):${COLOR_RESET} "
+            read -r raw_domain
+            DOMAIN=$(sanitize_input "${raw_domain}")
+            
+            if [[ -z "${DOMAIN}" ]]; then
+                log_error "Domain cannot be empty. Please try again."
                 continue
             fi
-        fi
-        
-        break
-    done
+            
+            # Basic domain validation
+            if [[ ! "${DOMAIN}" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]]; then
+                log_warning "The domain format seems invalid. Please verify your input."
+                if ! confirm "Continue with '${DOMAIN}'?"; then
+                    continue
+                fi
+            fi
+            
+            break
+        done
+    else
+        while true; do
+            echo -ne "${COLOR_WHITE}Enter your server IP address (e.g., 192.168.1.1):${COLOR_RESET} "
+            read -r raw_ip
+            DIRECT_IP=$(sanitize_input "${raw_ip}")
+            
+            if [[ -z "${DIRECT_IP}" ]]; then
+                log_error "IP address cannot be empty. Please try again."
+                continue
+            fi
+            
+            # Basic IP validation (IPv4)
+            if [[ ! "${DIRECT_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                log_warning "The IP address format seems invalid. Please verify your input."
+                if ! confirm "Continue with '${DIRECT_IP}'?"; then
+                    continue
+                fi
+            fi
+            
+            DOMAIN="${DIRECT_IP}"
+            break
+        done
+    fi
     
-    # Get API port
+    # Get API port with availability check
     while true; do
         echo -ne "${COLOR_WHITE}Enter API port (press Enter for random port):${COLOR_RESET} "
         read -r raw_api_port
         API_PORT=$(sanitize_input "${raw_api_port}")
         
         if [[ -z "${API_PORT}" ]]; then
-            API_PORT=$(( RANDOM % 55535 + 10000 ))
-            log_info "Using randomly generated port: ${API_PORT}"
+            # Generate random port and check availability
+            local attempts=0
+            local max_attempts=10
+            while [[ ${attempts} -lt ${max_attempts} ]]; do
+                API_PORT=$(( RANDOM % 55535 + 10000 ))
+                if check_port_available "${API_PORT}" "tcp"; then
+                    log_info "Using randomly generated port: ${API_PORT}"
+                    break
+                fi
+                attempts=$((attempts + 1))
+            done
+            
+            if [[ ${attempts} -eq ${max_attempts} ]]; then
+                log_error "Could not find an available port after ${max_attempts} attempts."
+                exit 1
+            fi
             break
         fi
         
@@ -277,23 +365,47 @@ function get_user_input() {
             continue
         fi
         
+        if ! check_port_available "${API_PORT}" "tcp"; then
+            log_warning "Port ${API_PORT} appears to be in use. Please choose a different port."
+            continue
+        fi
+        
         break
     done
     
-    # Get keys port
+    # Get keys port with availability check
     while true; do
         echo -ne "${COLOR_WHITE}Enter access keys port (press Enter for random port):${COLOR_RESET} "
         read -r raw_keys_port
         KEYS_PORT=$(sanitize_input "${raw_keys_port}")
         
         if [[ -z "${KEYS_PORT}" ]]; then
-            KEYS_PORT=$(( RANDOM % 55535 + 10000 ))
-            log_info "Using randomly generated port: ${KEYS_PORT}"
+            # Generate random port and check availability
+            local attempts=0
+            local max_attempts=10
+            while [[ ${attempts} -lt ${max_attempts} ]]; do
+                KEYS_PORT=$(( RANDOM % 55535 + 10000 ))
+                if check_port_available "${KEYS_PORT}" "tcp" && check_port_available "${KEYS_PORT}" "udp"; then
+                    log_info "Using randomly generated port: ${KEYS_PORT}"
+                    break
+                fi
+                attempts=$((attempts + 1))
+            done
+            
+            if [[ ${attempts} -eq ${max_attempts} ]]; then
+                log_error "Could not find an available port after ${max_attempts} attempts."
+                exit 1
+            fi
             break
         fi
         
         if [[ ! "${KEYS_PORT}" =~ ^[0-9]+$ ]] || [[ "${KEYS_PORT}" -lt 1 ]] || [[ "${KEYS_PORT}" -gt 65535 ]]; then
             log_error "Invalid port number. Port must be between 1 and 65535."
+            continue
+        fi
+        
+        if ! check_port_available "${KEYS_PORT}" "tcp" || ! check_port_available "${KEYS_PORT}" "udp"; then
+            log_warning "Port ${KEYS_PORT} appears to be in use. Please choose a different port."
             continue
         fi
         
@@ -313,7 +425,8 @@ function get_user_input() {
     print_separator
     log_info "Configuration Summary:"
     echo ""
-    echo "  ${COLOR_WHITE}Domain:${COLOR_RESET}       ${DOMAIN}"
+    echo "  ${COLOR_WHITE}Mode:${COLOR_RESET}         $([ "${USE_CLOUDFLARE}" == "yes" ] && echo "Cloudflare Tunnel" || echo "Direct Connection")"
+    echo "  ${COLOR_WHITE}Domain/IP:${COLOR_RESET}    ${DOMAIN}"
     echo "  ${COLOR_WHITE}API Port:${COLOR_RESET}     ${API_PORT}"
     echo "  ${COLOR_WHITE}Keys Port:${COLOR_RESET}    ${KEYS_PORT}"
     echo ""
@@ -675,6 +788,98 @@ EOF
 }
 
 # =============================================================================
+# DNS VALIDATION FUNCTION
+# =============================================================================
+
+function validate_dns_setup() {
+    log_info "Validating DNS configuration for ${DOMAIN}..."
+    
+    # Check if domain resolves
+    if ! command_exists dig; then
+        log_warning "dig command not available, skipping DNS validation."
+        return 0
+    fi
+    
+    # Check A/AAAA records
+    local dns_result
+    dns_result=$(dig +short "${DOMAIN}" 2>/dev/null)
+    
+    if [[ -z "${dns_result}" ]]; then
+        log_error "Domain ${DOMAIN} does not resolve to any IP address."
+        return 1
+    fi
+    
+    log_info "DNS resolution successful: ${DOMAIN} -> ${dns_result}"
+    
+    # Check if domain is proxied through Cloudflare (orange cloud)
+    local cloudflare_check
+    cloudflare_check=$(dig +short "${DOMAIN}" ANY 2>/dev/null | grep -i "cloudflare" || true)
+    
+    if [[ -n "${cloudflare_check}" ]]; then
+        log_success "Domain appears to be properly configured with Cloudflare."
+    else
+        log_warning "Domain may not be proxied through Cloudflare."
+        log_warning "Ensure SSL/TLS mode is set to 'Full (strict)' in Cloudflare dashboard."
+    fi
+    
+    return 0
+}
+
+# =============================================================================
+# SYSTEMD SERVICE CREATION FUNCTION
+# =============================================================================
+
+function create_outline_service() {
+    log_info "Creating systemd service for outline-ss-server..."
+    
+    local service_file="/etc/systemd/system/outline-ss.service"
+    
+    # Create service file
+    cat <<EOF | sudo tee "${service_file}" > /dev/null
+[Unit]
+Description=Outline SS Server
+After=network.target docker.service
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=${SHADOWBOX_DIR}/outline-ss-server -config ${CONFIG_YAML}
+Restart=on-failure
+RestartSec=5
+User=root
+WorkingDirectory=${SHADOWBOX_DIR}
+StandardOutput=append:${SHADOWBOX_DIR}/outline-ss.log
+StandardError=append:${SHADOWBOX_DIR}/outline-ss.log
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${SHADOWBOX_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Set permissions
+    sudo chmod 644 "${service_file}"
+    
+    # Reload systemd and enable service
+    sudo systemctl daemon-reload
+    sudo systemctl enable outline-ss.service
+    sudo systemctl start outline-ss.service
+    
+    # Verify service status
+    if sudo systemctl is-active --quiet outline-ss.service; then
+        log_success "outline-ss-server systemd service created and started."
+        return 0
+    else
+        log_warning "Service created but may not have started. Check with: systemctl status outline-ss.service"
+        return 0
+    fi
+}
+
+# =============================================================================
 # OUTLINE SS SERVER FUNCTIONS
 # =============================================================================
 
@@ -922,12 +1127,13 @@ function display_final_output() {
     
     echo -e "${COLOR_WHITE}${COLOR_BOLD}📋 Server Information:${COLOR_RESET}"
     echo ""
-    echo "  ${COLOR_WHITE}Domain:${COLOR_RESET}      ${DOMAIN}"
-    echo "  ${COLOR_WHITE}API Port:${COLOR_RESET}    ${API_PORT}"
-    echo "  ${COLOR_WHITE}Keys Port:${COLOR_RESET}   ${KEYS_PORT}"
-    echo "  ${COLOR_WHITE}Tunnel Port:${COLOR_RESET} ${TUNNEL_PORT}"
-    echo "  ${COLOR_WHITE}TCP Path:${COLOR_RESET}    ${TCP_PATH}"
-    echo "  ${COLOR_WHITE}UDP Path:${COLOR_RESET}    ${UDP_PATH}"
+    echo "  ${COLOR_WHITE}Mode:${COLOR_RESET}        $([ "${USE_CLOUDFLARE}" == "yes" ] && echo "Cloudflare Tunnel" || echo "Direct Connection")"
+    echo "  ${COLOR_WHITE}Domain/IP:${COLOR_RESET}    ${DOMAIN}"
+    echo "  ${COLOR_WHITE}API Port:${COLOR_RESET}     ${API_PORT}"
+    echo "  ${COLOR_WHITE}Keys Port:${COLOR_RESET}    ${KEYS_PORT}"
+    echo "  ${COLOR_WHITE}Tunnel Port:${COLOR_RESET}  ${TUNNEL_PORT}"
+    echo "  ${COLOR_WHITE}TCP Path:${COLOR_RESET}     ${TCP_PATH}"
+    echo "  ${COLOR_WHITE}UDP Path:${COLOR_RESET}     ${UDP_PATH}"
     echo ""
     
     echo -e "${COLOR_WHITE}${COLOR_BOLD}🔑 To manage your server, copy this line into Outline Manager:${COLOR_RESET}"
@@ -935,11 +1141,20 @@ function display_final_output() {
     echo -e "${COLOR_GREEN}${COLOR_BOLD}${json_output}${COLOR_RESET}"
     echo ""
     
+    # Save JSON to file for easy access
+    local json_file="${SHADOWBOX_DIR}/access_key.json"
+    echo "${json_output}" | sudo tee "${json_file}" > /dev/null
+    sudo chmod 600 "${json_file}"
+    
     echo -e "${COLOR_WHITE}${COLOR_BOLD}📁 Important Files:${COLOR_RESET}"
-    echo "  ${COLOR_WHITE}Access Config:${COLOR_RESET}     ${ACCESS_CONFIG}"
-    echo "  ${COLOR_WHITE}Server Config:${COLOR_RESET}     ${CONFIG_YAML}"
-    echo "  ${COLOR_WHITE}Cloudflare Config:${COLOR_RESET} ${CLOUDFLARED_CONFIG}"
-    echo "  ${COLOR_WHITE}Installation Log:${COLOR_RESET}  ${FULL_LOG}"
+    echo "  ${COLOR_WHITE}Access Config (text):${COLOR_RESET}  ${ACCESS_CONFIG}"
+    echo "  ${COLOR_WHITE}Access Key (JSON):${COLOR_RESET}     ${json_file}"
+    echo "  ${COLOR_WHITE}Server Config:${COLOR_RESET}         ${CONFIG_YAML}"
+    if [[ "${USE_CLOUDFLARE}" == "yes" ]]; then
+        echo "  ${COLOR_WHITE}Cloudflare Config:${COLOR_RESET}   ${CLOUDFLARED_CONFIG}"
+    fi
+    echo "  ${COLOR_WHITE}Systemd Service:${COLOR_RESET}       /etc/systemd/system/outline-ss.service"
+    echo "  ${COLOR_WHITE}Installation Log:${COLOR_RESET}      ${FULL_LOG}"
     echo ""
     
     echo -e "${COLOR_YELLOW}${COLOR_BOLD}⚠️  IMPORTANT NOTES:${COLOR_RESET}"
@@ -949,16 +1164,29 @@ function display_final_output() {
     echo "     sudo ufw allow ${KEYS_PORT}/tcp"
     echo "     sudo ufw allow ${KEYS_PORT}/udp"
     echo ""
-    echo "  ${COLOR_YELLOW}2.${COLOR_RESET} Cloudflare Configuration:"
-    echo "     - Ensure ${DOMAIN} is properly configured on Cloudflare"
-    echo "     - SSL/TLS mode should be set to 'Full (strict)'"
-    echo "     - Cloudflare Tunnel should be running:"
-    echo "       systemctl status cloudflared-${TUNNEL_NAME}"
-    echo ""
-    echo "  ${COLOR_YELLOW}3.${COLOR_RESET} Security:"
-    echo "     - The certificate is self-signed (valid for 100 years)"
-    echo "     - Keep the access config file secure: ${ACCESS_CONFIG}"
-    echo "     - Change the secret key periodically for better security"
+    
+    if [[ "${USE_CLOUDFLARE}" == "yes" ]]; then
+        echo "  ${COLOR_YELLOW}2.${COLOR_RESET} Cloudflare Configuration:"
+        echo "     - Ensure ${DOMAIN} is properly configured on Cloudflare"
+        echo "     - SSL/TLS mode should be set to 'Full (strict)'"
+        echo "     - Cloudflare Tunnel should be running:"
+        echo "       systemctl status cloudflared-${TUNNEL_NAME}"
+        echo ""
+        echo "  ${COLOR_YELLOW}3.${COLOR_RESET} Security:"
+        echo "     - The certificate is self-signed (valid for 100 years)"
+        echo "     - Keep the access config file secure: ${ACCESS_CONFIG}"
+        echo "     - Change the secret key periodically for better security"
+    else
+        echo "  ${COLOR_YELLOW}2.${COLOR_RESET} Direct Connection Mode:"
+        echo "     - Your server IP (${DIRECT_IP:-${DOMAIN}}) must be publicly accessible"
+        echo "     - Ensure firewall allows incoming connections on ports ${API_PORT} and ${KEYS_PORT}"
+        echo "     - Consider using a domain with proper SSL certificate for production"
+        echo ""
+        echo "  ${COLOR_YELLOW}3.${COLOR_RESET} Security:"
+        echo "     - The certificate is self-signed (valid for 100 years)"
+        echo "     - Keep the access config file secure: ${ACCESS_CONFIG}"
+        echo "     - Change the secret key periodically for better security"
+    fi
     echo ""
     
     echo -e "${COLOR_GREEN}${COLOR_BOLD}🚀 NEXT STEPS:${COLOR_RESET}"
@@ -968,6 +1196,16 @@ function display_final_output() {
     echo "  3. ${COLOR_WHITE}Click 'Add Server' > 'Enter server information manually'${COLOR_RESET}"
     echo "  4. ${COLOR_WHITE}Paste the JSON and click 'Done'${COLOR_RESET}"
     echo "  5. ${COLOR_WHITE}Create access keys and share them with users${COLOR_RESET}"
+    echo ""
+    
+    echo -e "${COLOR_WHITE}${COLOR_BOLD}🔧 Useful Commands:${COLOR_RESET}"
+    echo "  - Check server status:     systemctl status outline-ss.service"
+    echo "  - Restart server:          systemctl restart outline-ss.service"
+    echo "  - View logs:               journalctl -u outline-ss.service -f"
+    if [[ "${USE_CLOUDFLARE}" == "yes" ]]; then
+        echo "  - Check tunnel status:     systemctl status cloudflared-${TUNNEL_NAME}"
+        echo "  - Restart tunnel:          systemctl restart cloudflared-${TUNNEL_NAME}"
+    fi
     echo ""
     
     print_separator
@@ -992,7 +1230,7 @@ function main() {
     log_info "Installation log: ${FULL_LOG}"
     echo ""
     
-    # Get user input
+    # Get user input (includes Cloudflare Tunnel choice)
     get_user_input
     
     # System checks
@@ -1017,18 +1255,37 @@ function main() {
     run_step "Setting directory permissions" sudo chmod 700 "${SHADOWBOX_DIR}" && sudo chmod 700 "${STATE_DIR}"
     echo ""
     
-    # Cloudflare Tunnel setup
-    log_info "=== Cloudflare Tunnel Setup ==="
-    run_step "Installing cloudflared" install_cloudflared
-    run_step "Cloudflare authentication" check_cloudflare_auth
-    run_step "Setting up Cloudflare Tunnel" setup_cloudflare_tunnel
-    echo ""
+    # Cloudflare Tunnel setup (only if user chose Cloudflare mode)
+    if [[ "${USE_CLOUDFLARE}" == "yes" ]]; then
+        log_info "=== Cloudflare Tunnel Setup ==="
+        run_step "Installing cloudflared" install_cloudflared
+        run_step "Cloudflare authentication" check_cloudflare_auth
+        run_step "Setting up Cloudflare Tunnel" setup_cloudflare_tunnel
+        
+        # Validate DNS configuration
+        log_info "Validating DNS configuration..."
+        if ! validate_dns_setup; then
+            log_warning "DNS validation failed. Please ensure your domain points to Cloudflare."
+            if ! confirm "Continue anyway?"; then
+                exit 1
+            fi
+        fi
+        echo ""
+    else
+        log_info "=== Direct Connection Mode ==="
+        log_info "Skipping Cloudflare Tunnel setup (Direct IP mode selected)"
+        TUNNEL_URL="https://${DOMAIN}"
+        echo ""
+    fi
     
     # Outline SS Server setup
     log_info "=== Outline SS Server Setup ==="
     run_step "Downloading outline-ss-server" install_outline_ss_server
     run_step "Configuring outline-ss-server" configure_outline_ss_server
     run_step "Starting outline-ss-server" start_outline_ss_server
+    
+    # Create systemd service for outline-ss-server
+    run_step "Creating systemd service" create_outline_service
     echo ""
     
     # Certificate and access key
