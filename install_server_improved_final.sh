@@ -195,8 +195,8 @@ function print_banner() {
 ${COLOR_CYAN}
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
-║   ${COLOR_WHITE}Outline Server Installer v3.2${COLOR_CYAN}                          ║
-║   ${COLOR_WHITE}Final Gold Standard - Cloudflare Tunnel + WebSocket${COLOR_CYAN}   ║
+║   ${COLOR_WHITE}Outline Server Installer v4.0${COLOR_CYAN}                          ║
+║   ${COLOR_WHITE}Ultimate Gold Standard - Cloudflare + Direct Mode${COLOR_CYAN}     ║
 ║                                                              ║
 ║   ${COLOR_YELLOW}Designed for Restricted Networks${COLOR_CYAN}                      ║
 ║                                                              ║
@@ -425,8 +425,14 @@ function get_user_input() {
     print_separator
     log_info "Configuration Summary:"
     echo ""
-    echo "  ${COLOR_WHITE}Mode:${COLOR_RESET}         $([ "${USE_CLOUDFLARE}" == "yes" ] && echo "Cloudflare Tunnel" || echo "Direct Connection")"
-    echo "  ${COLOR_WHITE}Domain/IP:${COLOR_RESET}    ${DOMAIN}"
+    if [[ "${USE_CLOUDFLARE}" == "yes" ]]; then
+        echo "  ${COLOR_WHITE}Mode:${COLOR_RESET}         ${COLOR_GREEN}Cloudflare Tunnel${COLOR_RESET}"
+        echo "  ${COLOR_WHITE}Domain:${COLOR_RESET}       ${COLOR_BOLD}${DOMAIN}${COLOR_RESET}"
+    else
+        echo "  ${COLOR_WHITE}Mode:${COLOR_RESET}         ${COLOR_YELLOW}Direct Connection${COLOR_RESET}"
+        echo "  ${COLOR_WHITE}Server IP:${COLOR_RESET}    ${COLOR_BOLD}${DIRECT_IP}${COLOR_RESET}"
+    fi
+    echo ""
     echo "  ${COLOR_WHITE}API Port:${COLOR_RESET}     ${API_PORT}"
     echo "  ${COLOR_WHITE}Keys Port:${COLOR_RESET}    ${KEYS_PORT}"
     echo ""
@@ -663,23 +669,24 @@ function check_cloudflare_auth() {
     echo ""
     log_info "Please follow these steps to authenticate with Cloudflare:"
     echo ""
-    echo "  1. ${COLOR_WHITE}Run the following command to get a login URL:${COLOR_RESET}"
-    echo "     ${COLOR_WHITE}cloudflared tunnel login${COLOR_RESET}"
+    echo "  ${COLOR_WHITE}Step 1:${COLOR_RESET} Run the following command to get a login URL"
+    echo "          ${COLOR_BOLD}cloudflared tunnel login${COLOR_RESET}"
     echo ""
-    echo "  2. ${COLOR_WHITE}Copy the URL shown in the terminal.${COLOR_RESET}"
-    echo "  3. ${COLOR_WHITE}Open the URL in your browser (on your computer).${COLOR_RESET}"
-    echo "  4. ${COLOR_WHITE}Log in to Cloudflare and select your domain (${DOMAIN}).${COLOR_RESET}"
-    echo "  5. ${COLOR_WHITE}After authorization, return to this terminal and press Enter.${COLOR_RESET}"
+    echo "  ${COLOR_WHITE}Step 2:${COLOR_RESET} Copy the URL shown in the terminal"
+    echo "  ${COLOR_WHITE}Step 3:${COLOR_RESET} Open the URL in your browser (on your computer)"
+    echo "  ${COLOR_WHITE}Step 4:${COLOR_RESET} Log in to Cloudflare and select your domain: ${COLOR_BOLD}${DOMAIN}${COLOR_RESET}"
+    echo "  ${COLOR_WHITE}Step 5:${COLOR_RESET} After authorization, return here and press Enter"
     echo ""
 
     if confirm "Run cloudflared login now?"; then
         echo ""
-        log_info "Running cloudflared tunnel login. Please look for the URL in the output below:"
+        log_info "Running cloudflared tunnel login..."
+        log_info "Please wait, a URL will appear below. Copy it and open in your browser:"
         echo ""
-        # Run cloudflared login and capture output, but let user see it
+        # Run cloudflared login - user needs to see the URL
         cloudflared tunnel login 2>&1 | tee -a "${FULL_LOG}"
         echo ""
-        log_info "After completing the browser authorization, press Enter to continue."
+        log_info "After opening the URL in your browser and completing authorization, press Enter to continue."
         read -r
     else
         log_error "Cloudflare authentication is required to continue."
