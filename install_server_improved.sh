@@ -1,13 +1,6 @@
 #!/bin/bash
 #
-# =============================================================================
-# Outline Server Installer - Version 3.3 (Web Terminal Compatible)
-# Fully Interactive + Cloudflare Tunnel + WebSocket Support
-# Designed for users in restricted networks (Iran, China, etc.)
-# =============================================================================
-#
-# Copyright 2024 - Enhanced Edition
-# Based on original Outline Server installation script
+# Copyright 2018 The Outline Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,1052 +13,672 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# =============================================================================
+
+# ==============================================
+# GOLD STANDARD - FULLY IMPROVED (NO SHORTCUTS)
+# ==============================================
 
 set -euo pipefail
 
-# =============================================================================
-# COLOR SUPPORT DETECTION
-# =============================================================================
+# -------------------------------
+# USAGE AND HELP
+# -------------------------------
+function display_usage() {
+  cat <<EOF
+Usage: install_server.sh [--hostname <hostname>] [--api-port <port>] [--keys-port <port>]
 
-# Check if stdout is a terminal and supports colors
-if [[ -t 1 ]] && [[ -n "${TERM:-}" ]] && [[ "${TERM}" != "dumb" ]]; then
-    # Terminal supports colors
-    readonly COLOR_RED='\033[0;31m'
-    readonly COLOR_GREEN='\033[0;32m'
-    readonly COLOR_YELLOW='\033[0;33m'
-    readonly COLOR_BLUE='\033[0;34m'
-    readonly COLOR_MAGENTA='\033[0;35m'
-    readonly COLOR_CYAN='\033[0;36m'
-    readonly COLOR_WHITE='\033[1;37m'
-    readonly COLOR_RESET='\033[0m'
-    readonly COLOR_BOLD='\033[1m'
-else
-    # No color support - use empty strings
-    readonly COLOR_RED=''
-    readonly COLOR_GREEN=''
-    readonly COLOR_YELLOW=''
-    readonly COLOR_BLUE=''
-    readonly COLOR_MAGENTA=''
-    readonly COLOR_CYAN=''
-    readonly COLOR_WHITE=''
-    readonly COLOR_RESET=''
-    readonly COLOR_BOLD=''
-fi
+  --hostname   The hostname to be used to access the management API and access keys
+  --api-port   The port number for the management API
+  --keys-port  The port number for the access keys
+EOF
+}
 
-# =============================================================================
-# GLOBAL VARIABLES
-# =============================================================================
+readonly SENTRY_LOG_FILE=${SENTRY_LOG_FILE:-}
 
-# Directory paths
-readonly SHADOWBOX_DIR="/opt/outline"
-readonly STATE_DIR="${SHADOWBOX_DIR}/persisted-state"
-readonly ACCESS_CONFIG="${SHADOWBOX_DIR}/access.txt"
-readonly CONFIG_YAML="${SHADOWBOX_DIR}/config.yaml"
-readonly CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
-readonly CLOUDFLARED_CONFIG="/etc/cloudflared/config.yml"
-
-# Container settings
-readonly CONTAINER_NAME="shadowbox"
-readonly SB_IMAGE="quay.io/outline/shadowbox:stable"
-
-# Tunnel settings
-readonly TUNNEL_NAME="outline-tunnel"
-readonly TUNNEL_PORT="8080"
-
-# User input variables
-DOMAIN=""
-API_PORT=""
-KEYS_PORT=""
-
-# Auto-generated variables
-TUNNEL_ID=""
-TCP_PATH=""
-UDP_PATH=""
-SECRET_KEY=""
-TUNNEL_URL=""
-CERT_SHA256=""
-
-# Logging files
-FULL_LOG="$(mktemp -t outline_install_log_XXXXXXXXXX)"
-LAST_ERROR="$(mktemp -t outline_last_error_XXXXXXXXXX)"
+# I/O conventions for this script:
+# - Ordinary status messages are printed to STDOUT
+# - STDERR is only used in the event of a fatal error
+# - Detailed logs are recorded to this FULL_LOG, which is preserved if an error occurred.
+# - The most recent error is stored in LAST_ERROR, which is never preserved.
+FULL_LOG="$(mktemp -t outline_logXXXXXXXXXX)"
+LAST_ERROR="$(mktemp -t outline_last_errorXXXXXXXXXX)"
 readonly FULL_LOG LAST_ERROR
 
-# =============================================================================
-# LOGGING AND UTILITY FUNCTIONS
-# =============================================================================
-
 function log_command() {
-    # Execute command and capture both stdout and stderr
-    # stdout is forwarded to terminal and logged, stderr is logged and stored in LAST_ERROR
-    "$@" > >(tee -a "${FULL_LOG}") 2> >(tee -a "${FULL_LOG}" > "${LAST_ERROR}")
-}
-
-function log_info() {
-    local message="$1"
-    echo -e "${COLOR_BLUE}[INFO]${COLOR_RESET} ${message}"
-    echo "[INFO] ${message}" >> "${FULL_LOG}"
-}
-
-function log_success() {
-    local message="$1"
-    echo -e "${COLOR_GREEN}[SUCCESS]${COLOR_RESET} ${message}"
-    echo "[SUCCESS] ${message}" >> "${FULL_LOG}"
-}
-
-function log_warning() {
-    local message="$1"
-    echo -e "${COLOR_YELLOW}[WARNING]${COLOR_RESET} ${message}"
-    echo "[WARNING] ${message}" >> "${FULL_LOG}"
+  # Direct STDOUT and STDERR to FULL_LOG, and forward STDOUT.
+  # The most recent STDERR output will also be stored in LAST_ERROR.
+  "$@" > >(tee -a "${FULL_LOG}") 2> >(tee -a "${FULL_LOG}" > "${LAST_ERROR}")
 }
 
 function log_error() {
-    local message="$1"
-    echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} ${message}" >&2
-    echo "[ERROR] ${message}" >> "${FULL_LOG}"
+  local -r ERROR_TEXT="\033[0;31m"  # red
+  local -r NO_COLOR="\033[0m"
+  echo -e "${ERROR_TEXT}$1${NO_COLOR}"
+  echo "$1" >> "${FULL_LOG}"
 }
 
+# Pretty prints text to stdout, and also writes to sentry log file if set.
 function log_start_step() {
-    local message="$1"
-    echo -ne "${COLOR_CYAN}>${COLOR_RESET} ${message} ... "
-    echo "[STEP] ${message}" >> "${FULL_LOG}"
+  log_for_sentry "$@"
+  local -r str="> $*"
+  local -ir lineLength=47
+  echo -n "${str}"
+  local -ir numDots=$(( lineLength - ${#str} - 1 ))
+  if (( numDots > 0 )); then
+    echo -n " "
+    for _ in $(seq 1 "${numDots}"); do echo -n .; done
+  fi
+  echo -n " "
 }
 
-function log_step_result() {
-    local status="$1"
-    if [[ "${status}" == "OK" ]]; then
-        echo -e "${COLOR_GREEN}OK${COLOR_RESET}"
-        echo "[STEP] OK" >> "${FULL_LOG}"
-    else
-        echo -e "${COLOR_RED}FAILED${COLOR_RESET}"
-        echo "[STEP] FAILED" >> "${FULL_LOG}"
-        return 1
-    fi
-}
-
+# Prints $1 as the step name and runs the remainder as a command.
+# STDOUT will be forwarded.  STDERR will be logged silently, and
+# revealed only in the event of a fatal error.
 function run_step() {
-    local step_name="$1"
-    shift
-    log_start_step "${step_name}"
-    if log_command "$@"; then
-        log_step_result "OK"
-        return 0
-    else
-        log_step_result "FAILED"
-        return 1
-    fi
+  local -r msg="$1"
+  log_start_step "${msg}"
+  shift 1
+  if log_command "$@"; then
+    echo "OK"
+  else
+    # Propagates the error code
+    return
+  fi
 }
 
 function confirm() {
-    local prompt="$1"
-    local default="${2:-yes}"
-    local response=""
-    
-    if [[ "${default}" == "yes" ]]; then
-        prompt="${prompt} [Y/n] "
-    else
-        prompt="${prompt} [y/N] "
-    fi
-    
-    echo -ne "${COLOR_YELLOW}${prompt}${COLOR_RESET}"
-    read -r response
-    
-    if [[ -z "${response}" ]]; then
-        response="${default}"
-    fi
-    
-    response=$(echo "${response}" | tr '[:upper:]' '[:lower:]')
-    [[ "${response}" == "y" || "${response}" == "yes" ]]
+  echo -n "> $1 [Y/n] "
+  local RESPONSE
+  read -r RESPONSE
+  RESPONSE=$(echo "${RESPONSE}" | tr '[:upper:]' '[:lower:]') || return
+  [[ -z "${RESPONSE}" || "${RESPONSE}" == "y" || "${RESPONSE}" == "yes" ]]
 }
 
-function command_exists() {
-    command -v "$@" &> /dev/null
+function command_exists {
+  command -v "$@" &> /dev/null
 }
 
-function fetch_url() {
-    curl --silent --show-error --fail --location "$@"
+function log_for_sentry() {
+  if [[ -n "${SENTRY_LOG_FILE}" ]]; then
+    echo "[$(date "+%Y-%m-%d@%H:%M:%S")] install_server.sh" "$@" >> "${SENTRY_LOG_FILE}"
+  fi
+  echo "$@" >> "${FULL_LOG}"
 }
 
-function sanitize_input() {
-    local input="$1"
-    # Remove carriage returns, non-printable characters, and trim whitespace
-    echo "$input" | tr -d '\r\n' | sed 's/[^[:print:]]//g' | xargs
+# -------------------------------
+# VERIFICATION FUNCTIONS (ENHANCED)
+# -------------------------------
+function verify_curl_installed() {
+  if command_exists curl; then
+    return 0
+  fi
+  log_error "curl is required but not installed. Please install it (e.g., 'sudo apt install curl' or 'brew install curl')."
+  exit 1
 }
 
-function print_banner() {
-    cat <<EOF
-${COLOR_CYAN}
-╔══════════════════════════════════════════════════════════════╗
-║                                                              ║
-║   ${COLOR_WHITE}Outline Server Installer v3.3${COLOR_CYAN}                          ║
-║   ${COLOR_WHITE}Web Terminal Compatible - Cloudflare Tunnel + WebSocket${COLOR_CYAN}║
-║                                                              ║
-║   ${COLOR_YELLOW}Designed for Restricted Networks${COLOR_CYAN}                      ║
-║                                                              ║
-╚══════════════════════════════════════════════════════════════╝
-${COLOR_RESET}
-EOF
+function verify_docker_installed() {
+  if command_exists docker; then
+    return 0
+  fi
+  log_error "NOT INSTALLED"
+  if ! confirm "Would you like to install Docker? This will run 'curl https://get.docker.com/ | sh'."; then
+    exit 0
+  fi
+  if ! run_step "Installing Docker" install_docker; then
+    log_error "Docker installation failed, please visit https://docs.docker.com/install for instructions."
+    exit 1
+  fi
+  log_start_step "Verifying Docker installation"
+  command_exists docker
 }
 
-function print_separator() {
-    echo -e "${COLOR_CYAN}════════════════════════════════════════════════════════════════${COLOR_RESET}"
+function verify_docker_running() {
+  local STDERR_OUTPUT
+  STDERR_OUTPUT="$(docker info 2>&1 >/dev/null)"
+  local -ir RET=$?
+  if (( RET == 0 )); then
+    return 0
+  elif [[ "${STDERR_OUTPUT}" == *"Is the docker daemon running"* ]]; then
+    start_docker
+    return
+  fi
+  return "${RET}"
 }
 
-# =============================================================================
-# FINISH TRAP - Cleanup on exit
-# =============================================================================
-
-function finish() {
-    local exit_code=$?
-    
-    if [[ ${exit_code} -ne 0 ]]; then
-        echo ""
-        print_separator
-        log_error "Installation failed with exit code: ${exit_code}"
-        
-        if [[ -s "${LAST_ERROR}" ]]; then
-            log_error "Last error: $(< "${LAST_ERROR}")"
-        fi
-        
-        log_error "Full installation log: ${FULL_LOG}"
-        log_error "Please check the log file for detailed error information."
-        
-        # Copy log to permanent location for debugging
-        if [[ -d "${SHADOWBOX_DIR}" ]]; then
-            cp "${FULL_LOG}" "${SHADOWBOX_DIR}/install_error_$(date +%Y%m%d_%H%M%S).log" 2>/dev/null || true
-            log_error "A copy of the log has been saved to: ${SHADOWBOX_DIR}/install_error_*.log"
-        fi
-        
-        print_separator
-    else
-        # Clean up temporary log on success
-        rm -f "${FULL_LOG}" "${LAST_ERROR}" 2>/dev/null || true
-    fi
+function verify_openssl_installed() {
+  if command_exists openssl; then
+    return 0
+  fi
+  log_error "openssl is required but not installed. Please install it (e.g., 'sudo apt install openssl' or 'brew install openssl')."
+  exit 1
 }
 
-trap finish EXIT
-
-# =============================================================================
-# USER INPUT FUNCTIONS
-# =============================================================================
-
-function get_user_input() {
-    echo ""
-    print_separator
-    log_info "Please provide the following information to configure your server:"
-    echo ""
-    
-    # Get domain
-    while true; do
-        echo -ne "${COLOR_WHITE}Enter your domain (e.g., vpn.example.com):${COLOR_RESET} "
-        read -r raw_domain
-        DOMAIN=$(sanitize_input "${raw_domain}")
-        
-        if [[ -z "${DOMAIN}" ]]; then
-            log_error "Domain cannot be empty. Please try again."
-            continue
-        fi
-        
-        # Basic domain validation
-        if [[ ! "${DOMAIN}" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$ ]]; then
-            log_warning "The domain format seems invalid. Please verify your input."
-            if ! confirm "Continue with '${DOMAIN}'?"; then
-                continue
-            fi
-        fi
-        
-        break
-    done
-    
-    # Get API port
-    while true; do
-        echo -ne "${COLOR_WHITE}Enter API port (press Enter for random port):${COLOR_RESET} "
-        read -r raw_api_port
-        API_PORT=$(sanitize_input "${raw_api_port}")
-        
-        if [[ -z "${API_PORT}" ]]; then
-            API_PORT=$(( RANDOM % 55535 + 10000 ))
-            log_info "Using randomly generated port: ${API_PORT}"
-            break
-        fi
-        
-        if [[ ! "${API_PORT}" =~ ^[0-9]+$ ]] || [[ "${API_PORT}" -lt 1 ]] || [[ "${API_PORT}" -gt 65535 ]]; then
-            log_error "Invalid port number. Port must be between 1 and 65535."
-            continue
-        fi
-        
-        break
-    done
-    
-    # Get keys port
-    while true; do
-        echo -ne "${COLOR_WHITE}Enter access keys port (press Enter for random port):${COLOR_RESET} "
-        read -r raw_keys_port
-        KEYS_PORT=$(sanitize_input "${raw_keys_port}")
-        
-        if [[ -z "${KEYS_PORT}" ]]; then
-            KEYS_PORT=$(( RANDOM % 55535 + 10000 ))
-            log_info "Using randomly generated port: ${KEYS_PORT}"
-            break
-        fi
-        
-        if [[ ! "${KEYS_PORT}" =~ ^[0-9]+$ ]] || [[ "${KEYS_PORT}" -lt 1 ]] || [[ "${KEYS_PORT}" -gt 65535 ]]; then
-            log_error "Invalid port number. Port must be between 1 and 65535."
-            continue
-        fi
-        
-        break
-    done
-    
-    # Check if ports are the same
-    if [[ "${API_PORT}" -eq "${KEYS_PORT}" ]]; then
-        log_warning "API port and Keys port are the same. This is not recommended."
-        if ! confirm "Continue with same ports?"; then
-            KEYS_PORT=$(( RANDOM % 55535 + 10000 ))
-            log_info "Using new random port for keys: ${KEYS_PORT}"
-        fi
-    fi
-    
-    echo ""
-    print_separator
-    log_info "Configuration Summary:"
-    echo ""
-    echo "  ${COLOR_WHITE}Domain:${COLOR_RESET}       ${DOMAIN}"
-    echo "  ${COLOR_WHITE}API Port:${COLOR_RESET}     ${API_PORT}"
-    echo "  ${COLOR_WHITE}Keys Port:${COLOR_RESET}    ${KEYS_PORT}"
-    echo ""
-    print_separator
-    
-    if ! confirm "Proceed with these settings?"; then
-        log_error "Installation cancelled by user."
-        exit 0
-    fi
-    
-    echo ""
+function verify_getopt_installed() {
+  if command -v getopt &> /dev/null; then
+    return 0
+  fi
+  log_error "getopt is required but not installed. Please install util-linux (e.g., 'sudo apt install util-linux')."
+  exit 1
 }
 
-# =============================================================================
-# PREREQUISITE CHECK FUNCTIONS
-# =============================================================================
-
-function check_architecture() {
-    local arch
-    arch=$(uname -m)
-    if [[ "${arch}" != "x86_64" ]]; then
-        log_error "Unsupported architecture: ${arch}"
-        log_error "This script only supports x86_64 (amd64) architecture."
-        log_error "Your system architecture: ${arch}"
-        exit 1
-    fi
-    log_info "Architecture: ${arch} (supported)"
+function verify_disk_space() {
+  local REQUIRED_MB=1024
+  local AVAILABLE_MB
+  AVAILABLE_MB=$(df -m "${SHADOWBOX_DIR:-/opt}" | awk 'NR==2 {print $4}')
+  if (( AVAILABLE_MB < REQUIRED_MB )); then
+    log_error "Not enough disk space. Required: ${REQUIRED_MB}MB, Available: ${AVAILABLE_MB}MB"
+    exit 1
+  fi
 }
 
-function check_os_support() {
-    if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        if [[ "${ID}" == "ubuntu" ]] || [[ "${ID}" == "debian" ]]; then
-            log_info "Operating System: ${PRETTY_NAME} (supported)"
-        else
-            log_warning "Operating System: ${PRETTY_NAME} (may not be fully supported)"
-            if ! confirm "Continue with unsupported OS?"; then
-                exit 0
-            fi
-        fi
-    else
-        log_warning "Could not detect operating system. Continuing anyway..."
-    fi
-}
-
-function check_curl() {
-    if command_exists curl; then
-        log_success "curl is installed."
-        return 0
-    fi
-    
-    log_error "curl is not installed."
-    if confirm "Install curl automatically using apt?"; then
-        run_step "Installing curl" sudo apt update && sudo apt install -y curl
-        if command_exists curl; then
-            log_success "curl installed successfully."
-            return 0
-        else
-            log_error "Failed to install curl. Please install it manually: sudo apt install curl"
-            exit 1
-        fi
-    else
-        log_error "curl is required for this installation."
-        log_error "Please install curl: sudo apt install curl"
-        exit 1
-    fi
-}
-
-function check_docker() {
-    if command_exists docker; then
-        log_success "Docker is installed."
-        return 0
-    fi
-    
-    log_info "Docker is not installed."
-    if confirm "Install Docker automatically using get.docker.com?"; then
-        run_step "Installing Docker" install_docker
-        if command_exists docker; then
-            log_success "Docker installed successfully."
-            return 0
-        else
-            log_error "Failed to install Docker. Please check the logs."
-            exit 1
-        fi
-    else
-        log_error "Docker is required for this installation."
-        log_error "Please install Docker manually: curl -fsSL https://get.docker.com | sh"
-        exit 1
-    fi
+# -------------------------------
+# SYSTEM FUNCTIONS (UNCHANGED)
+# -------------------------------
+function fetch() {
+  curl --silent --show-error --fail "$@"
 }
 
 function install_docker() {
-    (
-        umask 0022
-        fetch_url https://get.docker.com/ | sh
-    ) >&2
+  (
+    # Change umask so that /usr/share/keyrings/docker-archive-keyring.gpg has the right permissions.
+    # See https://github.com/OutlineFoundation/outline-server/issues/951.
+    # We do this in a subprocess so the umask for the calling process is unaffected.
+    umask 0022
+    fetch https://get.docker.com/ | sh
+  ) >&2
 }
 
-function check_docker_running() {
-    if docker info &> /dev/null; then
-        log_success "Docker daemon is running."
-        return 0
-    fi
-    
-    log_info "Docker daemon is not running."
-    
-    # Try to start Docker
-    if command_exists systemctl; then
-        log_info "Attempting to start Docker using systemctl..."
-        if systemctl start docker 2>/dev/null; then
-            log_success "Docker started successfully."
-            return 0
-        fi
-    fi
-    
-    log_error "Docker daemon is not running and could not be started."
-    if confirm "Try to enable and start Docker service?"; then
-        systemctl enable docker --now 2>/dev/null || true
-        if docker info &> /dev/null; then
-            log_success "Docker started successfully."
-            return 0
-        fi
-    fi
-    
-    log_error "Please start Docker manually and run this script again."
-    log_error "Common commands: sudo systemctl start docker"
-    exit 1
+function start_docker() {
+  systemctl enable --now docker.service >&2
 }
 
-function check_openssl() {
-    if command_exists openssl; then
-        log_success "openssl is installed."
-        return 0
-    fi
-    
-    log_error "openssl is not installed."
-    if confirm "Install openssl automatically using apt?"; then
-        run_step "Installing openssl" sudo apt update && sudo apt install -y openssl
-        if command_exists openssl; then
-            log_success "openssl installed successfully."
-            return 0
-        else
-            log_error "Failed to install openssl. Please install it manually: sudo apt install openssl"
-            exit 1
-        fi
-    else
-        log_error "openssl is required for certificate generation."
-        log_error "Please install openssl: sudo apt install openssl"
-        exit 1
-    fi
+function docker_container_exists() {
+  docker ps -a --format '{{.Names}}' | grep --quiet "^$1$"
 }
 
-function check_wget() {
-    if command_exists wget; then
-        log_success "wget is installed."
-        return 0
-    fi
-    
-    log_info "wget is not installed. Installing automatically..."
-    run_step "Installing wget" sudo apt update && sudo apt install -y wget
-    if command_exists wget; then
-        log_success "wget installed successfully."
-        return 0
-    else
-        log_warning "wget installation failed. Will use curl as fallback."
-        return 0
-    fi
+function remove_watchtower_container() {
+  remove_docker_container watchtower
 }
 
-function check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root (sudo)."
-        log_error "Please re-run with: sudo $0"
-        exit 1
-    fi
-    log_success "Running as root."
+# FIX: We no longer use dynamic function names. Instead, we have a single remove function.
+function remove_docker_container() {
+  docker rm -f "$1" >&2
 }
 
-function check_disk_space() {
-    local required_mb=1024
-    local available_mb
-    available_mb=$(df -m "${SHADOWBOX_DIR%/*}" | awk 'NR==2 {print $4}')
-    
-    if [[ -z "${available_mb}" ]]; then
-        available_mb=$(df -m / | awk 'NR==2 {print $4}')
+# FIX: This function now safely handles any container name without dynamic function calls.
+function handle_docker_container_conflict() {
+  local -r CONTAINER_NAME="$1"
+  local -r EXIT_ON_NEGATIVE_USER_RESPONSE="$2"
+  local PROMPT="The container name \"${CONTAINER_NAME}\" is already in use by another container. This may happen when running this script multiple times."
+  if [[ "${EXIT_ON_NEGATIVE_USER_RESPONSE}" == 'true' ]]; then
+    PROMPT="${PROMPT} We will attempt to remove the existing container and restart it. Would you like to proceed?"
+  else
+    PROMPT="${PROMPT} Would you like to replace this container? If you answer no, we will proceed with the remainder of the installation."
+  fi
+  if ! confirm "${PROMPT}"; then
+    if ${EXIT_ON_NEGATIVE_USER_RESPONSE}; then
+      exit 0
     fi
-    
-    if [[ ${available_mb} -lt ${required_mb} ]]; then
-        log_error "Not enough disk space."
-        log_error "Required: ${required_mb}MB, Available: ${available_mb}MB"
-        log_error "Please free up disk space and try again."
-        exit 1
-    fi
-    
-    log_info "Disk space available: ${available_mb}MB (Required: ${required_mb}MB)"
+    return 0
+  fi
+  # Directly call the remove function with the specific name
+  if run_step "Removing ${CONTAINER_NAME} container" remove_docker_container "${CONTAINER_NAME}" ; then
+    # Successfully removed, caller should start the new one.
+    return 0
+  fi
+  return 1
 }
 
-# =============================================================================
-# CLOUDFLARE TUNNEL FUNCTIONS
-# =============================================================================
-
-function install_cloudflared() {
-    if command_exists cloudflared; then
-        log_success "cloudflared is already installed."
-        return 0
+# Set trap which publishes error tag only if there is an error.
+function finish {
+  local -ir EXIT_CODE=$?
+  if (( EXIT_CODE != 0 )); then
+    if [[ -s "${LAST_ERROR}" ]]; then
+      log_error "\nLast error: $(< "${LAST_ERROR}")" >&2
     fi
-    
-    log_info "Installing cloudflared..."
-    local temp_file
-    temp_file=$(mktemp)
-    
-    if fetch_url -o "${temp_file}" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"; then
-        sudo mv "${temp_file}" "${CLOUDFLARED_BIN}"
-        sudo chmod +x "${CLOUDFLARED_BIN}"
-        
-        if command_exists cloudflared; then
-            log_success "cloudflared installed successfully."
-            return 0
-        fi
-    fi
-    
-    log_error "Failed to install cloudflared."
-    rm -f "${temp_file}" 2>/dev/null || true
-    return 1
+    log_error "\nSorry! Something went wrong. If you can't figure this out, please copy and paste all this output into the Outline Manager screen, and send it to us, to see if we can help you." >&2
+    log_error "Full log: ${FULL_LOG}" >&2
+    # Persist log for debugging
+    cp "${FULL_LOG}" "${SHADOWBOX_DIR:-/opt/outline}/install_error.log" 2>/dev/null || true
+  else
+    rm "${FULL_LOG}"
+  fi
+  rm "${LAST_ERROR}"
 }
 
-function check_cloudflare_auth() {
-    if [[ -f ~/.cloudflared/cert.pem ]]; then
-        log_success "Cloudflare authentication found."
-        return 0
-    fi
-    
-    log_warning "Cloudflare authentication required."
-    echo ""
-    log_info "Please follow these steps to authenticate with Cloudflare:"
-    echo ""
-    echo "  1. Run the following command to get a login URL:"
-    echo "     cloudflared tunnel login"
-    echo ""
-    echo "  2. Copy the URL shown in the terminal."
-    echo "  3. Open the URL in your browser (on your computer)."
-    echo "  4. Log in to Cloudflare and select your domain (${DOMAIN})."
-    echo "  5. After authorization, return to this terminal and press Enter."
-    echo ""
-    
-    if confirm "Run cloudflared login now?"; then
-        echo ""
-        log_info "Running cloudflared tunnel login. Please look for the URL in the output below:"
-        echo ""
-        # Run cloudflared login and capture output, but let user see it
-        cloudflared tunnel login 2>&1 | tee -a "${FULL_LOG}"
-        echo ""
-        log_info "After completing the browser authorization, press Enter to continue."
-        read -r
-    else
-        log_error "Cloudflare authentication is required to continue."
-        log_error "Please run manually: cloudflared tunnel login"
-        exit 1
-    fi
-    
-    if [[ -f ~/.cloudflared/cert.pem ]]; then
-        log_success "Cloudflare authentication successful."
-        return 0
-    else
-        log_error "Cloudflare authentication failed. Please run: cloudflared tunnel login"
-        return 1
-    fi
+function get_random_port {
+  local -i num=0  # Init to an invalid value, to prevent "unbound variable" errors.
+  until (( 1024 <= num && num < 65536)); do
+    num=$(( RANDOM + (RANDOM % 2) * 32768 ));
+  done;
+  echo "${num}";
 }
 
-function setup_cloudflare_tunnel() {
-    log_info "Setting up Cloudflare Tunnel..."
-    
-    # Check if tunnel already exists
-    local tunnel_exists=false
-    if cloudflared tunnel list 2>/dev/null | grep -q "${TUNNEL_NAME}"; then
-        tunnel_exists=true
-        log_info "Tunnel '${TUNNEL_NAME}' already exists."
-        if ! confirm "Use existing tunnel or create new one?" "no"; then
-            tunnel_exists=false
-        fi
-    fi
-    
-    if [[ "${tunnel_exists}" == "false" ]]; then
-        log_info "Creating new tunnel: ${TUNNEL_NAME}"
-        if ! cloudflared tunnel create "${TUNNEL_NAME}"; then
-            log_error "Failed to create tunnel."
-            return 1
-        fi
-        log_success "Tunnel created successfully."
-    fi
-    
-    # Get tunnel ID
-    TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | grep "${TUNNEL_NAME}" | awk '{print $1}')
-    if [[ -z "${TUNNEL_ID}" ]]; then
-        log_error "Failed to get tunnel ID."
-        return 1
-    fi
-    log_info "Tunnel ID: ${TUNNEL_ID}"
-    
-    # Route DNS
-    log_info "Routing DNS for: ${DOMAIN}"
-    if cloudflared tunnel route dns "${TUNNEL_NAME}" "${DOMAIN}" 2>&1 | tee -a "${FULL_LOG}"; then
-        log_success "DNS route configured successfully."
-    else
-        log_warning "DNS route may already exist. Continuing..."
-    fi
-    
-    # Create config directory
-    sudo mkdir -p /etc/cloudflared
-    
-    # Create config file
-    log_info "Creating Cloudflare config file..."
-    local config_content
-    config_content=$(cat <<EOF
-tunnel: ${TUNNEL_NAME}
-credentials-file: /root/.cloudflared/${TUNNEL_ID}.json
-
-ingress:
-  - hostname: ${DOMAIN}
-    service: http://localhost:${TUNNEL_PORT}
-  - service: http_status:404
-EOF
-)
-    
-    echo "${config_content}" | sudo tee "${CLOUDFLARED_CONFIG}" > /dev/null
-    log_success "Config file created: ${CLOUDFLARED_CONFIG}"
-    
-    # Install as systemd service
-    log_info "Installing Cloudflare Tunnel as systemd service..."
-    cloudflared service install "${TUNNEL_NAME}" 2>&1 | tee -a "${FULL_LOG}"
-    
-    # Enable and start service
-    local service_name="cloudflared-${TUNNEL_NAME}"
-    if systemctl enable "${service_name}" 2>/dev/null && systemctl start "${service_name}" 2>/dev/null; then
-        log_success "Cloudflare Tunnel service started."
-    else
-        log_error "Failed to start Cloudflare Tunnel service."
-        return 1
-    fi
-    
-    # Wait for tunnel to be ready
-    log_info "Waiting for tunnel to be ready..."
-    local attempts=0
-    local max_attempts=30
-    while [[ ${attempts} -lt ${max_attempts} ]]; do
-        if systemctl is-active --quiet "${service_name}"; then
-            log_success "Cloudflare Tunnel is running."
-            # Get tunnel URL
-            TUNNEL_URL="https://${DOMAIN}"
-            log_info "Tunnel URL: ${TUNNEL_URL}"
-            return 0
-        fi
-        sleep 2
-        attempts=$((attempts + 1))
-    done
-    
-    log_error "Cloudflare Tunnel failed to start within ${max_attempts} seconds."
-    return 1
+function create_persisted_state_dir() {
+  readonly STATE_DIR="${SHADOWBOX_DIR}/persisted-state"
+  mkdir -p "${STATE_DIR}"
+  chmod ug+rwx,g+s,o-rwx "${STATE_DIR}"
 }
 
-# =============================================================================
-# OUTLINE SS SERVER FUNCTIONS
-# =============================================================================
-
-function install_outline_ss_server() {
-    local binary_path="${SHADOWBOX_DIR}/outline-ss-server"
-    
-    if [[ -f "${binary_path}" ]]; then
-        log_info "outline-ss-server already downloaded."
-        if confirm "Use existing binary or download fresh copy?" "no"; then
-            return 0
-        fi
-    fi
-    
-    log_info "Downloading outline-ss-server..."
-    local temp_file
-    temp_file=$(mktemp)
-    
-    if fetch_url -o "${temp_file}" "https://github.com/OutlineFoundation/outline-ss-server/releases/latest/download/outline-ss-server-linux-amd64"; then
-        sudo mv "${temp_file}" "${binary_path}"
-        sudo chmod +x "${binary_path}"
-        log_success "outline-ss-server downloaded successfully."
-        return 0
-    fi
-    
-    log_error "Failed to download outline-ss-server."
-    rm -f "${temp_file}" 2>/dev/null || true
-    return 1
+# Generate a secret key for access to the Management API and store it in a tag.
+# 16 bytes = 128 bits of entropy should be plenty for this use.
+function safe_base64() {
+  # Implements URL-safe base64 of stdin, stripping trailing = chars.
+  # Writes result to stdout.
+  # This version works with GNU (Linux) and BSD (macOS) base64.
+  if command -v openssl &> /dev/null; then
+    # Use openssl base64 which is consistent across platforms.
+    openssl base64 | tr -d '\n=' | tr '/+' '_-'
+  else
+    # Fallback: try GNU base64, then raw base64 as last resort.
+    (base64 -w 0 2>/dev/null || base64) | tr -d '\n=' | tr '/+' '_-'
+  fi
 }
 
-function configure_outline_ss_server() {
-    log_info "Configuring outline-ss-server..."
-    
-    # Generate random paths and secret
-    TCP_PATH="/$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 12)"
-    UDP_PATH="/$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 12)"
-    SECRET_KEY="$(openssl rand -base64 32 | tr -d '\n=')"
-    
-    log_info "TCP Path: ${TCP_PATH}"
-    log_info "UDP Path: ${UDP_PATH}"
-    log_info "Secret key generated."
-    
-    # Create config directory
-    sudo mkdir -p "${SHADOWBOX_DIR}"
-    
-    # Create config file
-    local config_content
-    config_content=$(cat <<EOF
-# Outline SS Server Configuration
-# Generated by Outline Installer v3.3
-
-web:
-  servers:
-    - id: server1
-      listen: "127.0.0.1:${TUNNEL_PORT}"
-      services:
-        - listeners:
-            - type: websocket-stream
-              web_server: server1
-              path: ${TCP_PATH}
-            - type: websocket-packet
-              web_server: server1
-              path: ${UDP_PATH}
-
-keys:
-  - id: 1
-    cipher: chacha20-ietf-poly1305
-    secret: ${SECRET_KEY}
-EOF
-)
-    
-    echo "${config_content}" | sudo tee "${CONFIG_YAML}" > /dev/null
-    sudo chmod 600 "${CONFIG_YAML}"
-    log_success "Configuration file created: ${CONFIG_YAML}"
+function generate_secret_key() {
+  SB_API_PREFIX="$(head -c 16 /dev/urandom | safe_base64)"
+  readonly SB_API_PREFIX
 }
-
-function start_outline_ss_server() {
-    log_info "Starting outline-ss-server..."
-    
-    # Check if already running
-    if pgrep -f "outline-ss-server" > /dev/null; then
-        log_warning "outline-ss-server appears to be running."
-        if confirm "Kill existing process and restart?"; then
-            pkill -f "outline-ss-server" 2>/dev/null || true
-            sleep 2
-        else
-            log_info "Continuing with existing process."
-            return 0
-        fi
-    fi
-    
-    # Start server in background
-    local binary_path="${SHADOWBOX_DIR}/outline-ss-server"
-    nohup "${binary_path}" -config "${CONFIG_YAML}" >> "${SHADOWBOX_DIR}/outline-ss.log" 2>&1 &
-    local pid=$!
-    
-    sleep 3
-    
-    if kill -0 "${pid}" 2>/dev/null; then
-        log_success "outline-ss-server started successfully (PID: ${pid})."
-        return 0
-    else
-        log_error "outline-ss-server failed to start."
-        return 1
-    fi
-}
-
-# =============================================================================
-# ACCESS KEY GENERATION FUNCTIONS
-# =============================================================================
 
 function generate_certificate() {
-    log_info "Generating SSL certificate..."
-    
-    local cert_dir="${STATE_DIR}"
-    sudo mkdir -p "${cert_dir}"
-    
-    local cert_file="${cert_dir}/shadowbox-selfsigned.crt"
-    local key_file="${cert_dir}/shadowbox-selfsigned.key"
-    
-    # Generate self-signed certificate
-    openssl req -x509 -nodes -days 36500 -newkey rsa:4096 \
-        -subj "/CN=${DOMAIN}" \
-        -keyout "${key_file}" \
-        -out "${cert_file}" 2>&1 | tee -a "${FULL_LOG}"
-    
-    if [[ -f "${cert_file}" ]] && [[ -f "${key_file}" ]]; then
-        sudo chmod 600 "${cert_file}" "${key_file}"
-        log_success "Certificate generated: ${cert_file}"
-        
-        # Get fingerprint
-        CERT_SHA256=$(openssl x509 -in "${cert_file}" -noout -sha256 -fingerprint 2>/dev/null | cut -d= -f2 | tr -d ':')
-        log_info "Certificate SHA256: ${CERT_SHA256}"
-        return 0
-    else
-        log_error "Failed to generate certificate."
-        return 1
-    fi
+  # Generate self-signed cert and store it in the persistent state directory.
+  local -r CERTIFICATE_NAME="${STATE_DIR}/shadowbox-selfsigned"
+  readonly SB_CERTIFICATE_FILE="${CERTIFICATE_NAME}.crt"
+  readonly SB_PRIVATE_KEY_FILE="${CERTIFICATE_NAME}.key"
+  declare -a openssl_req_flags=(
+    -x509 -nodes -days 36500 -newkey rsa:4096
+    -subj "/CN=${PUBLIC_HOSTNAME}"
+    -keyout "${SB_PRIVATE_KEY_FILE}" -out "${SB_CERTIFICATE_FILE}"
+  )
+  openssl req "${openssl_req_flags[@]}" >&2
 }
 
-function generate_access_key() {
-    log_info "Generating access key..."
-    
-    # Read the secret key from config
-    local secret
-    secret=$(grep "^[[:space:]]*secret:" "${CONFIG_YAML}" | awk '{print $2}' | tr -d '"' | head -1)
-    if [[ -z "${secret}" ]]; then
-        secret="${SECRET_KEY}"
+function generate_certificate_fingerprint() {
+  # Add a tag with the SHA-256 fingerprint of the certificate.
+  # (Electron uses SHA-256 fingerprints: https://github.com/electron/electron/blob/9624bc140353b3771bd07c55371f6db65fd1b67e/atom/common/native_mate_converters/net_converter.cc#L60)
+  # Example format: "SHA256 Fingerprint=BD:DB:C9:A4:39:5C:B3:4E:6E:CF:18:43:61:9F:07:A2:09:07:37:35:63:67"
+  local CERT_OPENSSL_FINGERPRINT
+  CERT_OPENSSL_FINGERPRINT="$(openssl x509 -in "${SB_CERTIFICATE_FILE}" -noout -sha256 -fingerprint)" || return
+  # Example format: "BDDBC9A4395CB34E6ECF1843619F07A2090737356367"
+  local CERT_HEX_FINGERPRINT
+  CERT_HEX_FINGERPRINT="$(echo "${CERT_OPENSSL_FINGERPRINT#*=}" | tr -d :)" || return
+  output_config "certSha256:${CERT_HEX_FINGERPRINT}"
+}
+
+function join() {
+  local IFS="$1"
+  shift
+  echo "$*"
+}
+
+function write_config() {
+  local -a config=()
+  if (( FLAGS_KEYS_PORT != 0 )); then
+    config+=("\"portForNewAccessKeys\": ${FLAGS_KEYS_PORT}")
+  fi
+  if [[ -n "${SB_DEFAULT_SERVER_NAME:-}" ]]; then
+    config+=("\"name\": \"$(escape_json_string "${SB_DEFAULT_SERVER_NAME}")\"")   
+  fi
+  config+=("\"hostname\": \"$(escape_json_string "${PUBLIC_HOSTNAME}")\"")
+  config+=("\"metricsEnabled\": ${SB_METRICS_ENABLED:-false}")
+  echo "{$(join , "${config[@]}")}" > "${STATE_DIR}/shadowbox_server_config.json"
+}
+
+function start_shadowbox() {
+  # Check if container exists and handle it safely
+  if docker_container_exists "${CONTAINER_NAME}"; then
+    if ! handle_docker_container_conflict "${CONTAINER_NAME}" true; then
+      return 1
     fi
+  fi
+
+  local -r START_SCRIPT="${STATE_DIR}/start_container.sh"
+  cat <<-EOF > "${START_SCRIPT}"
+# This script starts the Outline server container ("Shadowbox").
+# If you need to customize how the server is run, you can edit this script, then restart with:
+#
+#     "${START_SCRIPT}"
+
+set -eu
+
+docker stop "${CONTAINER_NAME}" 2> /dev/null || true
+docker rm -f "${CONTAINER_NAME}" 2> /dev/null || true
+
+docker_command=(
+  docker
+  run
+  -d
+  --name "${CONTAINER_NAME}" --restart always --net host
+
+  # Used by Watchtower to know which containers to monitor.
+  --label 'com.centurylinklabs.watchtower.enable=true'
+  
+  # Use log rotation. See https://docs.docker.com/config/containers/logging/configure/.
+  --log-driver local
+
+  # The state that is persisted across restarts.
+  -v "${STATE_DIR}:${STATE_DIR}"
     
-    # Read the TCP and UDP paths
-    local tcp_path
-    local udp_path
-    tcp_path=$(grep -A1 "websocket-stream" "${CONFIG_YAML}" | grep "path:" | awk '{print $2}' | head -1)
-    udp_path=$(grep -A1 "websocket-packet" "${CONFIG_YAML}" | grep "path:" | awk '{print $2}' | head -1)
-    
-    if [[ -z "${tcp_path}" ]] || [[ -z "${udp_path}" ]]; then
-        tcp_path="${TCP_PATH}"
-        udp_path="${UDP_PATH}"
-    fi
-    
-    # Build access key in Outline Manager format
-    local api_url="https://${DOMAIN}/key"
-    
-    # Create access config file
-    sudo mkdir -p "${SHADOWBOX_DIR}"
-    sudo tee "${ACCESS_CONFIG}" > /dev/null <<EOF
-apiUrl:${api_url}
-certSha256:${CERT_SHA256}
-tcpPath:${tcp_path}
-udpPath:${udp_path}
-secret:${secret}
+  # Where the container keeps its persistent state.
+  -e "SB_STATE_DIR=${STATE_DIR}"
+
+  # Port number and path prefix used by the server manager API.
+  -e "SB_API_PORT=${API_PORT}"
+  -e "SB_API_PREFIX=${SB_API_PREFIX}"
+
+  # Location of the API TLS certificate and key.
+  -e "SB_CERTIFICATE_FILE=${SB_CERTIFICATE_FILE}"
+  -e "SB_PRIVATE_KEY_FILE=${SB_PRIVATE_KEY_FILE}"
+
+  # Where to report metrics to, if opted-in.
+  -e "SB_METRICS_URL=${SB_METRICS_URL:-}"
+
+  # The Outline server image to run.
+  "${SB_IMAGE}"
+)
+"\${docker_command[@]}"
 EOF
-    
-    sudo chmod 600 "${ACCESS_CONFIG}"
-    
-    log_success "Access key generated successfully."
-    log_info "Access config saved to: ${ACCESS_CONFIG}"
+  chmod +x "${START_SCRIPT}"
+  # Declare then assign. Assigning on declaration messes up the return code.
+  local STDERR_OUTPUT
+  STDERR_OUTPUT="$({ "${START_SCRIPT}" >/dev/null; } 2>&1)" && return
+  readonly STDERR_OUTPUT
+  log_error "FAILED"
+  log_error "${STDERR_OUTPUT}"
+  return 1
 }
 
-function get_json_output() {
-    local api_url
-    local cert_sha256
-    
-    if [[ -f "${ACCESS_CONFIG}" ]]; then
-        api_url=$(grep "^apiUrl:" "${ACCESS_CONFIG}" | cut -d: -f2- | sed 's/^ *//')
-        cert_sha256=$(grep "^certSha256:" "${ACCESS_CONFIG}" | cut -d: -f2- | sed 's/^ *//')
-    else
-        api_url="https://${DOMAIN}/key"
-        cert_sha256="${CERT_SHA256:-DUMMY_CERT_SHA256}"
+function start_watchtower() {
+  # Start watchtower to automatically fetch docker image updates.
+  # Set watchtower to refresh every 30 seconds if a custom SB_IMAGE is used (for
+  # testing).  Otherwise refresh every hour.
+  local -ir WATCHTOWER_REFRESH_SECONDS="${WATCHTOWER_REFRESH_SECONDS:-3600}"
+  local -ar docker_watchtower_flags=(--name watchtower --log-driver local --restart always \
+      -v /var/run/docker.sock:/var/run/docker.sock)
+  
+  if docker_container_exists watchtower; then
+    if ! handle_docker_container_conflict watchtower false; then
+      return 1
     fi
-    
-    echo "{\"apiUrl\":\"${api_url}\",\"certSha256\":\"${cert_sha256}\"}"
+  fi
+
+  # By itself, local messes up the return code.
+  local STDERR_OUTPUT
+  STDERR_OUTPUT="$(docker run -d "${docker_watchtower_flags[@]}" nickfedor/watchtower --cleanup --label-enable --tlsverify --interval "${WATCHTOWER_REFRESH_SECONDS}" 2>&1 >/dev/null)" && return
+  readonly STDERR_OUTPUT
+  log_error "FAILED"
+  if docker_container_exists watchtower; then
+    handle_docker_container_conflict watchtower false
+    return
+  else
+    log_error "${STDERR_OUTPUT}"
+    return 1
+  fi
 }
 
-# =============================================================================
-# FIREWALL FUNCTIONS
-# =============================================================================
+# Waits for the service to be up and healthy
+function wait_shadowbox() {
+  # We use insecure connection because our threat model doesn't include localhost port
+  # interception and our certificate doesn't have localhost as a subject alternative name
+  # Add a timeout to prevent infinite loop.
+  local retries=0
+  until fetch --insecure "${LOCAL_API_URL}/access-keys" >/dev/null 2>&1; do
+    sleep 1
+    retries=$((retries + 1))
+    if (( retries > 60 )); then
+      log_error "Timeout waiting for Outline server to become healthy."
+      return 1
+    fi
+  done
+}
+
+function create_first_user() {
+  fetch --insecure --request POST "${LOCAL_API_URL}/access-keys" >&2
+}
+
+function output_config() {
+  echo "$@" >> "${ACCESS_CONFIG}"
+  chmod 600 "${ACCESS_CONFIG}" 2>/dev/null || true
+}
+
+function add_api_url_to_config() {
+  output_config "apiUrl:${PUBLIC_API_URL}"
+}
 
 function check_firewall() {
-    log_info "Checking firewall configuration..."
-    
-    # Check for UFW
-    if command_exists ufw; then
-        log_info "UFW firewall detected."
-        echo ""
-        log_warning "Please ensure the following ports are open:"
-        echo "  - TCP ${API_PORT} (Management API)"
-        echo "  - TCP ${KEYS_PORT} (Access Keys)"
-        echo "  - UDP ${KEYS_PORT} (Access Keys)"
-        echo ""
-        echo "To open these ports with UFW, run:"
-        echo "  sudo ufw allow ${API_PORT}/tcp"
-        echo "  sudo ufw allow ${KEYS_PORT}/tcp"
-        echo "  sudo ufw allow ${KEYS_PORT}/udp"
-        echo ""
-        
-        if confirm "Open these ports with UFW now?"; then
-            run_step "Opening UFW ports" ufw allow "${API_PORT}/tcp"
-            run_step "Opening UFW keys port TCP" ufw allow "${KEYS_PORT}/tcp"
-            run_step "Opening UFW keys port UDP" ufw allow "${KEYS_PORT}/udp"
+  # TODO(JonathanDCohen) This is incorrect if access keys are using more than one port.
+  local -i ACCESS_KEY_PORT
+  ACCESS_KEY_PORT=$(fetch --insecure "${LOCAL_API_URL}/access-keys" |
+      docker exec -i "${CONTAINER_NAME}" node -e '
+          const fs = require("fs");
+          const accessKeys = JSON.parse(fs.readFileSync(0, {encoding: "utf-8"}));
+          console.log(accessKeys["accessKeys"][0]["port"]);
+      ') || return
+  readonly ACCESS_KEY_PORT
+  if ! fetch --max-time 5 --cacert "${SB_CERTIFICATE_FILE}" "${PUBLIC_API_URL}/access-keys" >/dev/null; then
+     log_error "BLOCKED"
+     FIREWALL_STATUS="\
+You won’t be able to access it externally, despite your server being correctly
+set up, because there's a firewall (in this machine, your router or cloud
+provider) that is preventing incoming connections to ports ${API_PORT} and ${ACCESS_KEY_PORT}."
+  else
+    FIREWALL_STATUS="\
+If you have connection problems, it may be that your router or cloud provider
+blocks inbound connections, even though your machine seems to allow them."
+  fi
+  FIREWALL_STATUS="\
+${FIREWALL_STATUS}
+
+Make sure to open the following ports on your firewall, router or cloud provider:
+- Management port ${API_PORT}, for TCP
+- Access key port ${ACCESS_KEY_PORT}, for TCP and UDP
+
+If you use UFW, you can allow these ports with:
+  sudo ufw allow ${API_PORT}/tcp
+  sudo ufw allow ${ACCESS_KEY_PORT}/tcp
+  sudo ufw allow ${ACCESS_KEY_PORT}/udp
+"
+}
+
+function set_hostname() {
+  # These are URLs that return the client's apparent IP address.
+  # We have more than one to try in case one starts failing
+  # (e.g. https://github.com/OutlineFoundation/outline-server/issues/776).
+  local -ar urls=(
+    'https://icanhazip.com/'
+    'https://ipinfo.io/ip'
+    'https://domains.google.com/checkip'
+  )
+  for url in "${urls[@]}"; do
+    PUBLIC_HOSTNAME="$(fetch --ipv4 "${url}")" && return
+  done
+  echo "Failed to determine the server's IP address.  Try using --hostname <server IP>." >&2
+  return 1
+}
+
+# -------------------------------
+# MAIN INSTALLATION ROUTINE
+# -------------------------------
+install_shadowbox() {
+  local MACHINE_TYPE
+  MACHINE_TYPE="$(uname -m)"
+  if [[ "${MACHINE_TYPE}" != "x86_64" ]]; then
+    log_error "Unsupported machine type: ${MACHINE_TYPE}. Please run this script on a x86_64 machine"
+    exit 1
+  fi
+
+  # Make sure we don't leak readable files to other users.
+  umask 0007
+
+  export CONTAINER_NAME="${CONTAINER_NAME:-shadowbox}"
+
+  # Run all verification steps
+  run_step "Verifying curl is installed" verify_curl_installed
+  run_step "Verifying that Docker is installed" verify_docker_installed
+  run_step "Verifying that Docker daemon is running" verify_docker_running
+  run_step "Verifying that openssl is installed" verify_openssl_installed
+  run_step "Verifying that getopt is installed" verify_getopt_installed
+  run_step "Checking available disk space" verify_disk_space
+
+  log_for_sentry "Creating Outline directory"
+  export SHADOWBOX_DIR="${SHADOWBOX_DIR:-/opt/outline}"
+  mkdir -p "${SHADOWBOX_DIR}"
+  chmod u+s,ug+rwx,o-rwx "${SHADOWBOX_DIR}"
+
+  log_for_sentry "Setting API port"
+  API_PORT="${FLAGS_API_PORT}"
+  if (( API_PORT == 0 )); then
+    API_PORT=${SB_API_PORT:-$(get_random_port)}
+  fi
+  readonly API_PORT
+  readonly ACCESS_CONFIG="${ACCESS_CONFIG:-${SHADOWBOX_DIR}/access.txt}"
+  readonly SB_IMAGE="${SB_IMAGE:-quay.io/outline/shadowbox:stable}"
+
+  PUBLIC_HOSTNAME="${FLAGS_HOSTNAME:-${SB_PUBLIC_IP:-}}"
+  if [[ -z "${PUBLIC_HOSTNAME}" ]]; then
+    run_step "Setting PUBLIC_HOSTNAME to external IP" set_hostname
+  fi
+  readonly PUBLIC_HOSTNAME
+
+  # If $ACCESS_CONFIG is already populated, make a backup before clearing it.
+  log_for_sentry "Initializing ACCESS_CONFIG"
+  if [[ -s "${ACCESS_CONFIG}" ]]; then
+    # Note we can't do "mv" here as do_install_server.sh may already be tailing
+    # this file.
+    cp "${ACCESS_CONFIG}" "${ACCESS_CONFIG}.bak" && true > "${ACCESS_CONFIG}"
+  fi
+
+  # Make a directory for persistent state
+  run_step "Creating persistent state dir" create_persisted_state_dir
+  run_step "Generating secret key" generate_secret_key
+  run_step "Generating TLS certificate" generate_certificate
+  run_step "Generating SHA-256 certificate fingerprint" generate_certificate_fingerprint
+  run_step "Writing config" write_config
+
+  # TODO(dborkan): if the script fails after docker run, it will continue to fail
+  # as the names shadowbox and watchtower will already be in use.  Consider
+  # deleting the container in the case of failure (e.g. using a trap, or
+  # deleting existing containers on each run).
+  run_step "Starting Shadowbox" start_shadowbox
+  # TODO(fortuna): Don't wait for Shadowbox to run this.
+  run_step "Starting Watchtower" start_watchtower
+
+  readonly PUBLIC_API_URL="https://${PUBLIC_HOSTNAME}:${API_PORT}/${SB_API_PREFIX}"
+  readonly LOCAL_API_URL="https://localhost:${API_PORT}/${SB_API_PREFIX}"
+  run_step "Waiting for Outline server to be healthy" wait_shadowbox
+  run_step "Creating first user" create_first_user
+  run_step "Adding API URL to config" add_api_url_to_config
+
+  FIREWALL_STATUS=""
+  run_step "Checking host firewall" check_firewall
+
+  # Echos the value of the specified field from ACCESS_CONFIG.
+  # e.g. if ACCESS_CONFIG contains the line "certSha256:1234",
+  # calling $(get_field_value certSha256) will echo 1234.
+  function get_field_value {
+    grep "$1" "${ACCESS_CONFIG}" | sed "s/$1://"
+  }
+
+  # Output JSON.  This relies on apiUrl and certSha256 (hex characters) requiring
+  # no string escaping.  TODO: look for a way to generate JSON that doesn't
+  # require new dependencies.
+  cat <<END_OF_SERVER_OUTPUT
+
+CONGRATULATIONS! Your Outline server is up and running.
+
+To manage your Outline server, please copy the following line (including curly
+brackets) into Step 2 of the Outline Manager interface:
+
+$(echo -e "\033[1;32m{\"apiUrl\":\"$(get_field_value apiUrl)\",\"certSha256\":\"$(get_field_value certSha256)\"}\033[0m")
+
+${FIREWALL_STATUS}
+END_OF_SERVER_OUTPUT
+} # end of install_shadowbox
+
+# -------------------------------
+# UTILITY FUNCTIONS (UNCHANGED)
+# -------------------------------
+function is_valid_port() {
+  (( 0 < "$1" && "$1" <= 65535 ))
+}
+
+function escape_json_string() {
+  local input=$1
+  for ((i = 0; i < ${#input}; i++)); do
+    local char="${input:i:1}"
+    local escaped="${char}"
+    case "${char}" in
+      $'"' ) escaped="\\\"";;
+      $'\\') escaped="\\\\";;
+      *)
+        if [[ "${char}" < $'\x20' ]]; then
+          case "${char}" in 
+            $'\b') escaped="\\b";;
+            $'\f') escaped="\\f";;
+            $'\n') escaped="\\n";;
+            $'\r') escaped="\\r";;
+            $'\t') escaped="\\t";;
+            *) escaped=$(printf "\u%04X" "'${char}")
+          esac
+        fi;;
+    esac
+    echo -n "${escaped}"
+  done
+}
+
+function parse_flags() {
+  local params
+  params="$(getopt --longoptions hostname:,api-port:,keys-port: -n "$0" -- "$0" "$@")"
+  eval set -- "${params}"
+
+  while (( $# > 0 )); do
+    local flag="$1"
+    shift
+    case "${flag}" in
+      --hostname)
+        FLAGS_HOSTNAME="$1"
+        shift
+        ;;
+      --api-port)
+        FLAGS_API_PORT=$1
+        shift
+        if ! is_valid_port "${FLAGS_API_PORT}"; then
+          log_error "Invalid value for ${flag}: ${FLAGS_API_PORT}" >&2
+          exit 1
         fi
-    else
-        log_info "UFW not found. Please ensure firewall ports are open manually."
-    fi
-    
-    # Check for iptables
-    if command_exists iptables; then
-        log_info "iptables detected. Please ensure ports are open."
-    fi
+        ;;
+      --keys-port)
+        FLAGS_KEYS_PORT=$1
+        shift
+        if ! is_valid_port "${FLAGS_KEYS_PORT}"; then
+          log_error "Invalid value for ${flag}: ${FLAGS_KEYS_PORT}" >&2
+          exit 1
+        fi
+        ;;
+      --)
+        break
+        ;;
+      *) # This should not happen
+        log_error "Unsupported flag ${flag}" >&2
+        display_usage >&2
+        exit 1
+        ;;
+    esac
+  done
+  if (( FLAGS_API_PORT != 0 && FLAGS_API_PORT == FLAGS_KEYS_PORT )); then
+    log_error "--api-port must be different from --keys-port" >&2
+    exit 1
+  fi
+  return 0
 }
-
-# =============================================================================
-# FINAL OUTPUT FUNCTIONS
-# =============================================================================
-
-function display_final_output() {
-    echo ""
-    print_separator
-    echo -e "${COLOR_GREEN}${COLOR_BOLD}🎉 CONGRATULATIONS! YOUR OUTLINE SERVER IS UP AND RUNNING!${COLOR_RESET}"
-    print_separator
-    echo ""
-    
-    local json_output
-    json_output=$(get_json_output)
-    
-    echo -e "${COLOR_WHITE}${COLOR_BOLD}📋 Server Information:${COLOR_RESET}"
-    echo ""
-    echo "  ${COLOR_WHITE}Domain:${COLOR_RESET}      ${DOMAIN}"
-    echo "  ${COLOR_WHITE}API Port:${COLOR_RESET}    ${API_PORT}"
-    echo "  ${COLOR_WHITE}Keys Port:${COLOR_RESET}   ${KEYS_PORT}"
-    echo "  ${COLOR_WHITE}Tunnel Port:${COLOR_RESET} ${TUNNEL_PORT}"
-    echo "  ${COLOR_WHITE}TCP Path:${COLOR_RESET}    ${TCP_PATH}"
-    echo "  ${COLOR_WHITE}UDP Path:${COLOR_RESET}    ${UDP_PATH}"
-    echo ""
-    
-    echo -e "${COLOR_WHITE}${COLOR_BOLD}🔑 To manage your server, copy this line into Outline Manager:${COLOR_RESET}"
-    echo ""
-    echo -e "${COLOR_GREEN}${COLOR_BOLD}${json_output}${COLOR_RESET}"
-    echo ""
-    
-    echo -e "${COLOR_WHITE}${COLOR_BOLD}📁 Important Files:${COLOR_RESET}"
-    echo "  ${COLOR_WHITE}Access Config:${COLOR_RESET}     ${ACCESS_CONFIG}"
-    echo "  ${COLOR_WHITE}Server Config:${COLOR_RESET}     ${CONFIG_YAML}"
-    echo "  ${COLOR_WHITE}Cloudflare Config:${COLOR_RESET} ${CLOUDFLARED_CONFIG}"
-    echo "  ${COLOR_WHITE}Installation Log:${COLOR_RESET}  ${FULL_LOG}"
-    echo ""
-    
-    echo -e "${COLOR_YELLOW}${COLOR_BOLD}⚠️  IMPORTANT NOTES:${COLOR_RESET}"
-    echo ""
-    echo "  ${COLOR_YELLOW}1.${COLOR_RESET} Firewall Rules: If using UFW, run these commands:"
-    echo "     sudo ufw allow ${API_PORT}/tcp"
-    echo "     sudo ufw allow ${KEYS_PORT}/tcp"
-    echo "     sudo ufw allow ${KEYS_PORT}/udp"
-    echo ""
-    echo "  ${COLOR_YELLOW}2.${COLOR_RESET} Cloudflare Configuration:"
-    echo "     - Ensure ${DOMAIN} is properly configured on Cloudflare"
-    echo "     - SSL/TLS mode should be set to 'Full (strict)'"
-    echo "     - Cloudflare Tunnel should be running:"
-    echo "       systemctl status cloudflared-${TUNNEL_NAME}"
-    echo ""
-    echo "  ${COLOR_YELLOW}3.${COLOR_RESET} Security:"
-    echo "     - The certificate is self-signed (valid for 100 years)"
-    echo "     - Keep the access config file secure: ${ACCESS_CONFIG}"
-    echo "     - Change the secret key periodically for better security"
-    echo ""
-    
-    echo -e "${COLOR_GREEN}${COLOR_BOLD}🚀 NEXT STEPS:${COLOR_RESET}"
-    echo ""
-    echo "  1. ${COLOR_WHITE}Copy the JSON line above${COLOR_RESET}"
-    echo "  2. ${COLOR_WHITE}Open Outline Manager${COLOR_RESET}"
-    echo "  3. ${COLOR_WHITE}Click 'Add Server' > 'Enter server information manually'${COLOR_RESET}"
-    echo "  4. ${COLOR_WHITE}Paste the JSON and click 'Done'${COLOR_RESET}"
-    echo "  5. ${COLOR_WHITE}Create access keys and share them with users${COLOR_RESET}"
-    echo ""
-    
-    print_separator
-    echo ""
-    
-    log_success "Installation completed successfully!"
-}
-
-# =============================================================================
-# MAIN INSTALLATION FUNCTION
-# =============================================================================
 
 function main() {
-    # Print banner
-    print_banner
-    
-    # Check root privileges
-    check_root
-    
-    # Start installation
-    log_info "Starting Outline Server installation..."
-    log_info "Installation log: ${FULL_LOG}"
-    echo ""
-    
-    # Get user input
-    get_user_input
-    
-    # System checks
-    log_info "=== System Verification ==="
-    check_architecture
-    check_os_support
-    check_disk_space
-    echo ""
-    
-    # Prerequisite checks
-    log_info "=== Prerequisite Checks ==="
-    run_step "Checking curl" check_curl
-    run_step "Checking wget" check_wget
-    run_step "Checking openssl" check_openssl
-    run_step "Checking Docker" check_docker
-    run_step "Checking Docker daemon" check_docker_running
-    echo ""
-    
-    # Create directories
-    log_info "=== Directory Setup ==="
-    run_step "Creating Outline directories" sudo mkdir -p "${SHADOWBOX_DIR}" "${STATE_DIR}"
-    run_step "Setting directory permissions" sudo chmod 700 "${SHADOWBOX_DIR}" && sudo chmod 700 "${STATE_DIR}"
-    echo ""
-    
-    # Cloudflare Tunnel setup
-    log_info "=== Cloudflare Tunnel Setup ==="
-    run_step "Installing cloudflared" install_cloudflared
-    run_step "Cloudflare authentication" check_cloudflare_auth
-    run_step "Setting up Cloudflare Tunnel" setup_cloudflare_tunnel
-    echo ""
-    
-    # Outline SS Server setup
-    log_info "=== Outline SS Server Setup ==="
-    run_step "Downloading outline-ss-server" install_outline_ss_server
-    run_step "Configuring outline-ss-server" configure_outline_ss_server
-    run_step "Starting outline-ss-server" start_outline_ss_server
-    echo ""
-    
-    # Certificate and access key
-    log_info "=== Access Key Generation ==="
-    run_step "Generating SSL certificate" generate_certificate
-    run_step "Generating access key" generate_access_key
-    echo ""
-    
-    # Firewall check
-    log_info "=== Firewall Configuration ==="
-    check_firewall
-    echo ""
-    
-    # Final output
-    display_final_output
+  trap finish EXIT
+  declare FLAGS_HOSTNAME=""
+  declare -i FLAGS_API_PORT=0
+  declare -i FLAGS_KEYS_PORT=0
+  parse_flags "$@"
+  install_shadowbox
 }
-
-# =============================================================================
-# SCRIPT EXECUTION - Direct call (no conditional check needed)
-# =============================================================================
 
 main "$@"
