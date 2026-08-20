@@ -154,10 +154,10 @@ function verify_openssl_installed() {
 }
 
 function verify_getopt_installed() {
-  if command -v getopt &> /dev/null && getopt --test &> /dev/null; then
+  if command -v getopt &> /dev/null; then
     return 0
   fi
-  log_error "Enhanced getopt is required. Please install util-linux (e.g., 'sudo apt install util-linux' or 'brew install gnu-getopt')."
+  log_error "getopt is required but not installed. Please install util-linux (e.g., 'sudo apt install util-linux')."
   exit 1
 }
 
